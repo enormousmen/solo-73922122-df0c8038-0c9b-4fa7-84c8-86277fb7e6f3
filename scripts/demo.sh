@@ -76,6 +76,21 @@ probe_url "跳转链超过 3 次上限：第 5 跳未连接即拦截" \
   "http://loop1.demo.test${HPORT}/loop/1"
 switch_profile allowed
 
+# 5.5) 慢跳转：首跳 302、第二跳请求已发出但无完整响应 -> 408 逐跳报告
+echo
+echo "================================================================"
+echo "▶ 慢跳转超时：首跳 302 + 第二跳无响应（预期 HTTP 408，含逐跳报告）"
+echo "  （等待约 ${PROBE_OVERALL_TIMEOUT:-15}s 总超时）"
+curl -sS -o /tmp/slow-timeout.json -w 'HTTP %{http_code}\n' \
+  -X POST "${BASE}/api/v1/probe" \
+  -H 'Content-Type: application/json' \
+  -d "$(jq -n --arg u "http://allowed.demo.test${HPORT}/redirect-slow?delay=60&mode=hang" \
+        '{url:$u, method:"GET"}')"
+jq '.detail.hops // .hops' /tmp/slow-timeout.json
+echo "--- 第二跳目标确实收到了探测请求（host 以 slow. 开头）:"
+curl -sS "http://127.0.0.1:${TARGET_REQ_PORT}/_requests" \
+  | jq '[.[] | select(.host != null and (.host|startswith("slow.")))] | .[0:3]'
+
 # 6) 仅 IPv4 / 入口校验
 probe_url "IPv6 字面量：拒绝" "http://[2001:db8::1]/"
 probe_url "非 HTTP(S) scheme：拒绝" "ftp://allowed.demo.test${HPORT}/"

@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field
 
 from .config import Settings, load_settings
 from .dns_client import DnsResolver
-from .http_probe import Prober
+from .http_probe import HopReport, Prober, mark_overall_timeout
 from .policy import PolicyError
 
 
@@ -58,7 +58,7 @@ class HopReportModel(BaseModel):
     location: str | None = Field(None, description="3xx 响应的 Location 头")
     redirect_count: int
     outcome: str = Field(
-        ..., description="ok | redirected | blocked | error"
+        ..., description="ok | redirected | blocked | error | timeout"
     )
     reject_reason: str | None = Field(None, description="策略拒绝原因（面向白名单调整）")
     error: str | None = Field(None, description="连接/TLS/读取等错误原因")
@@ -74,6 +74,9 @@ class ProbeResponse(BaseModel):
     dns_server: str
     max_redirects: int
     elapsed_ms: int = Field(..., description="整次探测耗时（毫秒）")
+    timeout_hop: int | None = Field(
+        None, description="总超时时被中断的跳序号；未超时为 null"
+    )
 
 
 class PolicyResponse(BaseModel):
@@ -166,9 +169,12 @@ async def create_probe(req: ProbeRequest) -> ProbeResponse:
         )
 
     async with _semaphore:
+        # 调用方持有逐跳列表：总超时取消探测协程时，已完成/进行中的跳
+        # 仍留在列表里，408 才能报告“哪些目标收到了请求”。
+        hops: list[HopReport] = []
         try:
             hops = await asyncio.wait_for(
-                prober.probe(req.url, method=method),
+                prober.probe(req.url, method=method, hops=hops),
                 timeout=settings.overall_timeout,
             )
         except PolicyError as exc:
@@ -176,12 +182,41 @@ async def create_probe(req: ProbeRequest) -> ProbeResponse:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         except asyncio.TimeoutError:
             elapsed = int((time.monotonic() - started) * 1000)
+            interrupted = mark_overall_timeout(
+                hops,
+                f"探测总超时（{settings.overall_timeout}s）："
+                "本跳未收到完整响应，不能判定为可达",
+            )
+            if not hops:
+                # 极端情况：连第 1 跳都还没开始（例如 URL 校验前即被取消）
+                hops = [
+                    HopReport(
+                        hop=1, url=req.url, scheme="", hostname="", port=0,
+                        outcome="timeout",
+                        error=f"探测总超时（{settings.overall_timeout}s）",
+                        reason=f"探测总超时（{settings.overall_timeout}s）",
+                    )
+                ]
+                interrupted = hops[0]
+            timeout_hop = interrupted.hop if interrupted else None
             raise HTTPException(
                 status_code=408,
-                detail={
-                    "message": f"探测总超时（{settings.overall_timeout}s）",
-                    "elapsed_ms": elapsed,
-                },
+                detail=ProbeResponse(
+                    requested_url=req.url,
+                    method=method,
+                    outcome="timeout",
+                    summary=(
+                        f"探测总超时（{settings.overall_timeout}s）"
+                        + (f"，第 {timeout_hop} 跳未收到完整响应" if timeout_hop else "")
+                        + "；已完成跳保留原始结果，超时跳按实际进度记录"
+                    ),
+                    hops=[HopReportModel(**asdict(h)) for h in hops],
+                    allowed_cidrs=settings.allowed_cidrs,
+                    dns_server=f"{settings.dns_server}:{settings.dns_port}",
+                    max_redirects=settings.max_redirects,
+                    elapsed_ms=elapsed,
+                    timeout_hop=timeout_hop,
+                ).model_dump(),
             ) from None
 
     elapsed_ms = int((time.monotonic() - started) * 1000)
@@ -206,4 +241,5 @@ async def create_probe(req: ProbeRequest) -> ProbeResponse:
         dns_server=f"{settings.dns_server}:{settings.dns_port}",
         max_redirects=settings.max_redirects,
         elapsed_ms=elapsed_ms,
+        timeout_hop=None,
     )

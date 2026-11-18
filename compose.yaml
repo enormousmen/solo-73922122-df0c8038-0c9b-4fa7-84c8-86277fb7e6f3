@@ -50,6 +50,9 @@ services:
     networks:
       net_dns:
         ipv4_address: 172.31.0.53
+    ports:
+      # 仅供本机演示脚本切换 DNS profile
+      - "127.0.0.1:8053:8053"
     depends_on:
       certinit:
         condition: service_completed_successfully
@@ -60,11 +63,19 @@ services:
     command: ["python", "-m", "app.targets.server"]
     environment:
       CERT_DIR: /app/certs
+      # 可控慢目标：默认挂起 60s，可被 /slow?delay= 覆盖（上限 120s）
+      SLOW_HANG_SECONDS: "60"
+      MAX_SLOW_SECONDS: "120"
+      # /redirect-slow 的 Location 指向慢目标的 HTTP 端口
+      SLOW_REDIRECT_PORT: "80"
     volumes:
       - certs:/app/certs:ro
     networks:
       net_allowed:
         ipv4_address: 172.31.10.10
+    ports:
+      # 仅供本机演示脚本查看目标访问日志（/_requests）
+      - "127.0.0.1:8080:8080"
 
   # 禁止访问的目标：同镜像，位于禁止网段
   target-forbidden:
@@ -94,10 +105,12 @@ services:
       CA_BUNDLE: /app/certs/combined-ca-bundle.pem
       CONNECT_TIMEOUT: "5.0"
       TLS_TIMEOUT: "8.0"
-      READ_TIMEOUT: "10.0"
+      # 读超时故意大于总超时：慢目标挂起时由总超时统一收敛为 408，
+      # 便于演示“首跳 302、第二跳无响应”的逐跳超时报告。
+      READ_TIMEOUT: "45.0"
       MAX_REDIRECTS: "3"
       MAX_CONCURRENCY: "64"
-      PROBE_OVERALL_TIMEOUT: "30.0"
+      PROBE_OVERALL_TIMEOUT: "15.0"
     ports:
       - "127.0.0.1:8000:8000"
     volumes:

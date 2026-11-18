@@ -51,7 +51,7 @@ app/
   certinit/         生成演示 CA、服务器证书、合并 CA bundle
 dns-profiles/       DNS 场景：allowed / swapped / mixed / loop
 compose.yaml        一键启动的完整演示环境
-tests/              57 个测试（策略、DNS 协议、TLS、跳转、并发、API 全链路）
+tests/              测试（策略、DNS 协议、TLS、跳转、并发、API 全链路、408 逐跳报告）
 scripts/demo.sh     演示脚本
 ```
 
@@ -62,6 +62,17 @@ docker compose up -d --build
 # 探测 API（仅绑定本机回环）
 open http://127.0.0.1:8000/docs
 ```
+
+演示环境包含 `/docs` 交互入口：打开后可直接在浏览器中调用
+`POST /api/v1/probe`，无需手工构造请求。
+
+除探测 API 外，只把两个演示辅助端口绑定到本机回环：
+
+| 本机端口 | 作用 |
+| --- | --- |
+| `127.0.0.1:8000` | 探测 API（含 `/docs`） |
+| `127.0.0.1:8053` | 本地 DNS 控制面（查看/切换 profile） |
+| `127.0.0.1:8080` | 允许目标的 `/_requests`（验证目标是否收到请求） |
 
 演示环境网络拓扑（全部 IPv4，静态地址）：
 
@@ -103,6 +114,7 @@ open http://127.0.0.1:8000/docs
   "allowed_cidrs": ["172.31.10.0/24"],
   "dns_server": "172.31.0.53:53",
   "max_redirects": 3,
+  "timeout_hop": null,
   "hops": [
     {
       "hop": 1,
@@ -126,10 +138,71 @@ open http://127.0.0.1:8000/docs
 - `connected_peer`：**实际**建立 TCP 连接的 `ip:port`（固定为已批准 IP）；
 - `tls`：TLS 版本、套件、证书 subject/SAN（HTTPS 时）；
 - `request_sent`：是否真的发出了 HTTP 请求（被策略拒绝时恒为 `false`）；
-- `outcome`：`ok` / `redirected` / `blocked` / `error`；
+- `outcome`：`ok` / `redirected` / `blocked` / `error` / `timeout`；
 - `reject_reason` / `error`：拒绝或失败的具体原因。
 
 辅助接口：`GET /api/v1/policy`（当前白名单与超时配置）、`GET /healthz`。
+
+### 总超时（408）的逐跳报告
+
+单请求超过 `PROBE_OVERALL_TIMEOUT` 时返回 **408**，响应体为
+`{"detail": <与 200 相同的探测报告结构>}`，其中：
+
+- **已完成的跳原样保留**：`outcome`（`redirected`/`ok`/`blocked`/`error`）、
+  `status_code`、`resolved_addresses`、`approved_addresses`、`connected_peer`、
+  `request_sent` 与 `location` 都是真实结果；
+- **超时跳按实际进度记录**：已完成的 DNS 解析与已建立的连接照实写入，
+  `request_sent` 仅在请求确实写入连接后才为 `true`；未发送的跳保持 `false`，
+  未连接的跳 `connected_peer` 为 `null`；
+- 超时跳 `outcome="timeout"`、`status_code=null`：**未收到完整响应绝不判为可达**；
+- 顶层 `outcome="timeout"`、`timeout_hop` 指出被中断的跳序号。
+
+对端在响应头完整前关闭连接时，该跳记为 `outcome="error"`（不完整响应），
+同样不会报为可达。
+
+示例（首跳 302、第二跳请求已发出但无响应）：
+
+```json
+{
+  "detail": {
+    "outcome": "timeout",
+    "timeout_hop": 2,
+    "summary": "探测总超时（15.0s），第 2 跳未收到完整响应；...",
+    "hops": [
+      {"hop": 1, "outcome": "redirected", "status_code": 302,
+       "resolved_addresses": ["172.31.10.10"], "approved_addresses": ["172.31.10.10"],
+       "connected_peer": "172.31.10.10:80", "request_sent": true,
+       "location": "http://slow.demo.test/slow?delay=60&mode=hang"},
+      {"hop": 2, "outcome": "timeout", "status_code": null,
+       "resolved_addresses": ["172.31.10.10"], "approved_addresses": ["172.31.10.10"],
+       "connected_peer": "172.31.10.10:80", "request_sent": true,
+       "error": "探测总超时（15.0s）：本跳未收到完整响应，不能判定为可达"}
+    ]
+  }
+}
+```
+
+## 可控慢跳转目标（超时演示）
+
+允许目标内置两个端点，便于稳定复现“首跳 302、第二跳无响应”：
+
+| 端点 | 行为 |
+| --- | --- |
+| `GET /slow?delay=60&mode=hang` | 收下请求后静默挂起 `delay` 秒再返回 200；`mode=headers` 只发响应头（声称有 body）后挂起，不结束响应 |
+| `GET /redirect-slow?delay=60&mode=hang` | 首跳返回 302 → `http://slow.demo.test/slow?...`，第二跳即慢目标 |
+
+```bash
+# 15s 总超时下必然 408；返回的 hops 会指出第 2 跳已解析/连接/发送
+curl -sS -X POST http://127.0.0.1:8000/api/v1/probe \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"http://allowed.demo.test/redirect-slow?delay=60"}' | jq .
+
+# 验证第二跳确实收到了请求
+curl -sS http://127.0.0.1:8080/_requests | jq '[.[] | select(.host|startswith("slow."))]'
+```
+
+`delay` 上限由 `MAX_SLOW_SECONDS`（默认 120）钳制，默认值由
+`SLOW_HANG_SECONDS`（默认 60）提供。
 
 ## 演示场景与 DNS profile 切换
 
@@ -150,6 +223,8 @@ curl -X POST http://127.0.0.1:8053/profiles/switch \
 | `mixed` | 一次应答同时含允许与禁止地址，验证“全部获准才连接” |
 | `loop` | 连环 307 跳转，验证 3 次跳转上限 |
 
+四个 profile 都包含 `slow.demo.test → 172.31.10.10`，供慢跳转演示使用。
+
 ## 配置项（探测服务环境变量）
 
 | 变量 | 默认 | 说明 |
@@ -161,18 +236,23 @@ curl -X POST http://127.0.0.1:8053/profiles/switch \
 | `CONNECT_TIMEOUT` / `TLS_TIMEOUT` / `READ_TIMEOUT` | 5 / 8 / 10 秒 | 各阶段超时 |
 | `MAX_REDIRECTS` | 3 | 跳转上限，仅允许 0..3 |
 | `MAX_CONCURRENCY` | 64 | 在飞探测并发上限，超出返回 429 |
-| `PROBE_OVERALL_TIMEOUT` | 30 | 单请求总超时，超时返回 408 |
+| `PROBE_OVERALL_TIMEOUT` | 30 | 单请求总超时，超时返回 408 并附逐跳报告 |
+
+compose 演示环境将 `READ_TIMEOUT` 设为 45s、`PROBE_OVERALL_TIMEOUT` 设为 15s，
+使慢目标场景稳定由总超时收敛为 408（而不是先触发单阶段读超时）。
 
 ## 测试
 
 ```bash
-pip install -r requirements.txt pytest pytest-asyncio
+pip install -r requirements.txt pytest pytest-asyncio httpx
 pytest -q
 ```
 
-57 个测试覆盖：CIDR/URL 策略、DNS 编解码与压缩指针环路、全链路探测、
+66 个测试覆盖：CIDR/URL 策略、DNS 编解码与压缩指针环路、全链路探测、
 混合解析整体拒绝、检查后换址、跳转上限/跳禁区/非 HTTP 协议、HTTPS 证书
-主机名校验与不受信证书拒绝、慢探测并发非阻塞、429 保护、API 层。
+主机名校验与不受信证书拒绝、慢探测并发非阻塞、429 保护、API 层，
+以及 **408 逐跳超时报告**（完成跳保留状态、超时跳按进度记录、
+未发送不标记已发送、不完整响应不判可达）和演示慢目标端点。
 
 ## 设计边界与说明
 

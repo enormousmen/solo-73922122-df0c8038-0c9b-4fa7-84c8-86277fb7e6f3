@@ -15,12 +15,18 @@ import asyncio
 import os
 import time
 from collections import deque
+from urllib.parse import parse_qs, urlencode
 
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse
 
 CERT_DIR = os.getenv("CERT_DIR", "/app/certs")
+# 慢目标默认挂起时长（秒）；可被请求参数 delay 覆盖，便于“可控”演示。
+SLOW_HANG_SECONDS = float(os.getenv("SLOW_HANG_SECONDS", "60"))
+MAX_SLOW_SECONDS = float(os.getenv("MAX_SLOW_SECONDS", "120"))
+# 首跳跳转到慢目标时使用的端口（compose 内为标准 80）
+SLOW_REDIRECT_PORT = os.getenv("SLOW_REDIRECT_PORT", "80")
 RECENT_REQUESTS: deque[dict] = deque(maxlen=200)
 
 app = FastAPI(title="demo-targets", docs_url=None, redoc_url=None, openapi_url=None)
@@ -88,6 +94,24 @@ async def redirect_scheme():
     return RedirectResponse(url="file:///etc/passwd", status_code=302)
 
 
+@app.get("/redirect-slow")
+async def redirect_slow(
+    delay: float = SLOW_HANG_SECONDS,
+    mode: str = "hang",
+):
+    """首跳返回 302，第二跳指向“收下请求但不给完整响应”的慢目标。
+
+    这正是值班员遇到的场景：首跳 302、第二跳请求已发出却无响应，
+    最终接口返回 408 —— 此时 408 必须能指出第二跳的实际进度。
+    """
+    delay = min(max(delay, 0.0), MAX_SLOW_SECONDS)
+    if mode not in {"hang", "headers"}:
+        mode = "hang"
+    query = urlencode({"delay": delay, "mode": mode})
+    location = f"http://slow.demo.test:{SLOW_REDIRECT_PORT}/slow?{query}"
+    return RedirectResponse(url=location, status_code=302)
+
+
 @app.get("/final")
 async def final():
     return JSONResponse({"message": "跳转链终点，可达"})
@@ -117,6 +141,95 @@ async def loop_chain(n: int):
 @app.get("/secret")
 async def secret():
     return JSONResponse({"message": "禁止网段目标不应被任何探测请求到达"})
+
+
+class SlowTargetMiddleware:
+    """``/slow`` 的可控慢响应端点（纯 ASGI，绕开框架的完整响应生成）。
+
+    * ``mode=hang``：完全收下请求后保持连接、不发任何字节，最终（delay 秒后）
+      才返回 200 —— 探测端若在 delay 之前达到超时，必须报告超时而非可达；
+    * ``mode=headers``：只发响应头（声称有 body）便挂起，迟到不发 body。
+
+    该中间件位于最外层，因此 ``/_requests`` 的记录在此手动补上，便于验证
+    “第二跳确实收到了探测请求”。
+    """
+
+    def __init__(self, app) -> None:  # noqa: ANN001
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:  # noqa: ANN001
+        if scope["type"] != "http" or scope["path"] != "/slow":
+            await self.app(scope, receive, send)
+            return
+
+        query = {
+            k: v[-1]
+            for k, v in parse_qs(scope.get("query_string", b"").decode()).items()
+        }
+        try:
+            delay = float(query.get("delay", SLOW_HANG_SECONDS))
+        except ValueError:
+            delay = SLOW_HANG_SECONDS
+        delay = min(max(delay, 0.0), MAX_SLOW_SECONDS)
+        mode = query.get("mode", "hang")
+        if mode not in {"hang", "headers"}:
+            mode = "hang"
+        headers = {
+            k.decode("latin-1").lower(): v.decode("latin-1")
+            for k, v in scope.get("headers", [])
+        }
+        client = scope.get("client") or (None, None)
+        RECENT_REQUESTS.appendleft(
+            {
+                "ts": round(time.time(), 3),
+                "method": scope.get("method"),
+                "host": headers.get("host"),
+                "path": scope["path"],
+                "peer": client[0],
+                "user_agent": headers.get("user-agent"),
+                "slow_mode": mode,
+                "slow_delay": delay,
+            }
+        )
+
+        if mode == "headers":
+            try:
+                await send(
+                    {
+                        "type": "http.response.start",
+                        "status": 200,
+                        "headers": [
+                            (b"content-type", b"text/plain; charset=utf-8"),
+                            (b"content-length", b"64"),
+                        ],
+                    }
+                )
+                await asyncio.sleep(delay)  # 不发送 body
+            except (OSError, RuntimeError):
+                pass
+            return
+        # mode == "hang"：先静默挂起，超时窗口过去后才写出完整响应
+        await asyncio.sleep(delay)
+        body = b'{"message":"slow target completed after delay"}'
+        try:
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 200,
+                    "headers": [
+                        (b"content-type", b"application/json"),
+                        (b"content-length", str(len(body)).encode()),
+                        (b"connection", b"close"),
+                    ],
+                }
+            )
+            await send({"type": "http.response.body", "body": body})
+        except (OSError, RuntimeError):
+            # 探测端已超时断开：慢目标的“迟到响应”写不出去属预期行为
+            pass
+
+
+app.add_middleware(SlowTargetMiddleware)
 
 
 def _server_kwargs() -> dict:

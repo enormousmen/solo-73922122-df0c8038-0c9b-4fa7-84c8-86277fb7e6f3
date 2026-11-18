@@ -30,6 +30,7 @@ DEMO_NAMES = [
     "https.allowed.demo.test",
     "redirect-ok.demo.test",
     "redirect-final.demo.test",
+    "slow.demo.test",
     "forbidden.demo.test",
     "swapped.demo.test",
     "multi-a.demo.test",

@@ -33,6 +33,7 @@ DEFAULT_PORTS = {"http": 80, "https": 443}
 REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 MAX_REDIRECTS = 3
 MAX_BYTES = 64 * 1024
+OVERALL_TIMEOUT_REASON = "探测总超时：本跳未收到完整响应"
 
 
 @dataclass
@@ -65,6 +66,12 @@ class HopReport:
         self.error = message
         self.reason = message
 
+    def mark_timeout(self, message: str) -> None:
+        """总超时中断本跳：未收到完整响应，绝不能标记为可达。"""
+        self.outcome = "timeout"
+        self.error = message
+        self.reason = message
+
 
 class Prober:
     def __init__(
@@ -87,11 +94,22 @@ class Prober:
         self._max_redirects = max_redirects
         self._max_bytes = max_bytes
 
-    async def probe(self, url: str, method: str = "GET") -> list[HopReport]:
+    async def probe(
+        self,
+        url: str,
+        method: str = "GET",
+        hops: list[HopReport] | None = None,
+    ) -> list[HopReport]:
+        """执行探测并返回逐跳报告。
+
+        ``hops`` 可由调用方传入，用于总超时后读取“已经进行到哪一步”的
+        实时记录（超时取消时本协程来不及写返回值，但已写入的跳记录仍在）。
+        """
         method = method.upper()
         if method not in ("GET", "HEAD"):
             raise PolicyError("探测仅支持 GET/HEAD 方法")
-        hops: list[HopReport] = []
+        if hops is None:
+            hops = []
         redirects = 0
         current = url
         while True:
@@ -219,6 +237,7 @@ class Prober:
         try:
             writer.write(request_lines.encode("ascii", errors="replace"))
             await writer.drain()
+            # drain 成功才说明请求确实交给传输层：此前被取消不得标记为已发送。
             hop.request_sent = True
             response = await asyncio.wait_for(
                 self._read_response(reader), timeout=self._read_timeout
@@ -260,6 +279,11 @@ class Prober:
             header_blob += chunk
             if len(header_blob) > self._max_bytes:
                 raise PolicyError("响应头部超过大小上限")
+        if b"\r\n\r\n" not in header_blob:
+            # 对端在响应头完整之前关闭连接：只能视为不完整响应，不得判为可达
+            raise PolicyError(
+                "响应头不完整（连接在收到完整响应前关闭），无法判定可达"
+            )
         text = header_blob.decode("iso-8859-1")
         lines = text.split("\r\n")
         status_line = lines[0]
@@ -284,6 +308,35 @@ class Prober:
                 break
             body_read += len(chunk)
         return {"status": status, "reason": reason, "headers": headers}
+
+
+def mark_overall_timeout(hops: list[HopReport], message: str) -> HopReport | None:
+    """总超时后整理逐跳记录。
+
+    * 已完成的跳（ok/redirected/blocked/error）原样保留；
+    * 仍在进行中的跳按“实际进度”记为 timeout：解析地址、已连接地址与
+      是否真正发出请求都以已写入的字段为准，未发送不得伪造成已发送；
+    * 返回被标记的超时跳（若没有进行中的跳则返回 None）。
+    """
+    interrupted: HopReport | None = None
+    for hop in hops:
+        if hop.outcome != "pending":
+            continue
+        # 响应已完整收到（状态行与头部均已解析）但尚未推进到下一跳：
+        # 这是一次已完成的中转跳，保留真实状态而不是笼统记为超时。
+        if hop.status_code in REDIRECT_STATUSES:
+            hop.outcome = "redirected"
+            hop.error = None
+            hop.reason = hop.reason or message
+            continue
+        if hop.status_code is not None:
+            hop.outcome = "ok"
+            hop.error = None
+            hop.reason = hop.reason or message
+            continue
+        hop.mark_timeout(message)
+        interrupted = hop
+    return interrupted
 
 
 def normalize_redirect(base_url: str, location: str) -> str:
