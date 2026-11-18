@@ -1,0 +1,18 @@
+{
+  "profile": "mixed",
+  "description": "混合应答场景：一次 DNS 应答同时包含允许与禁止地址，必须整体拒绝",
+  "zones": {
+    "allowed.demo.test":        ["172.31.10.10"],
+    "www.allowed.demo.test":    ["172.31.10.10"],
+    "https.allowed.demo.test":  ["172.31.10.10"],
+    "multi-a.demo.test":        ["172.31.10.11", "172.31.20.10"],
+    "redirect-ok.demo.test":    ["172.31.10.10"],
+    "redirect-final.demo.test": ["172.31.10.10"],
+    "loop1.demo.test":          ["172.31.10.10"],
+    "loop2.demo.test":          ["172.31.10.10"],
+    "loop3.demo.test":          ["172.31.10.10"],
+    "loop4.demo.test":          ["172.31.10.10"],
+    "forbidden.demo.test":      ["172.31.20.10"],
+    "swapped.demo.test":        ["172.31.20.10", "172.31.10.10"]
+  }
+}

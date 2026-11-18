@@ -1,0 +1,119 @@
+# 出站探测演示环境（compose v2）
+#
+# 网络拓扑（全部 IPv4）：
+#   net_dns     172.31.0.0/24    本地可切换 DNS（探测服务唯一允许使用的解析器）
+#   net_allowed 172.31.10.0/24   允许访问的演示目标
+#   net_denied  172.31.20.0/24   禁止访问的演示目标
+# 探测服务只接入 net_dns + net_allowed；禁止目标在 net_denied 上，
+# 即使路由层可达（默认 compose 网络互通），也会在白名单校验阶段被拒绝。
+
+name: egress-probe-demo
+
+networks:
+  net_dns:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.31.0.0/24
+  net_allowed:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.31.10.0/24
+  net_denied:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.31.20.0/24
+
+services:
+  # 一次性任务：生成演示 CA、服务器证书与合并 CA bundle
+  certinit:
+    build: .
+    command: ["python", "-m", "app.certinit.generate_certs"]
+    volumes:
+      - certs:/app/certs
+    networks:
+      - net_dns
+
+  # 本地 DNS：UDP/53 解析，HTTP/8053 控制 profile 热切换
+  dns-service:
+    build: .
+    command: ["python", "-m", "app.dns_service.server"]
+    environment:
+      DNS_PROFILES_DIR: /app/dns-profiles
+      DNS_STATE_FILE: /tmp/dns-state/profile
+      DNS_CONTROL_PORT: "8053"
+    volumes:
+      - ./dns-profiles:/app/dns-profiles:ro
+      - dns-state:/tmp/dns-state
+    networks:
+      net_dns:
+        ipv4_address: 172.31.0.53
+    depends_on:
+      certinit:
+        condition: service_completed_successfully
+
+  # 允许访问的目标：HTTP/8080 + HTTPS/8443
+  target-allowed:
+    build: .
+    command: ["python", "-m", "app.targets.server"]
+    environment:
+      CERT_DIR: /app/certs
+    volumes:
+      - certs:/app/certs:ro
+    networks:
+      net_allowed:
+        ipv4_address: 172.31.10.10
+
+  # 禁止访问的目标：同镜像，位于禁止网段
+  target-forbidden:
+    build: .
+    command: ["python", "-m", "app.targets.server"]
+    environment:
+      CERT_DIR: /app/certs
+    volumes:
+      - certs:/app/certs:ro
+    networks:
+      net_denied:
+        ipv4_address: 172.31.20.10
+
+  # 出站探测 API（FastAPI），/docs 可直接访问
+  # 注意：probe 同时接入禁止网段（路由可达），但白名单不含该网段，
+  # 以此证明拦截来自应用层白名单策略，而非网络隔离。
+  probe:
+    build: .
+    command: ["uvicorn", "app.probe.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      # 白名单仅含允许目标网段；DNS 解析器地址不受目标白名单约束
+      ALLOWED_CIDRS: "172.31.10.0/24"
+      DNS_SERVER: "172.31.0.53"
+      DNS_PORT: "53"
+      DNS_TIMEOUT: "3.0"
+      DNS_RETRIES: "1"
+      CA_BUNDLE: /app/certs/combined-ca-bundle.pem
+      CONNECT_TIMEOUT: "5.0"
+      TLS_TIMEOUT: "8.0"
+      READ_TIMEOUT: "10.0"
+      MAX_REDIRECTS: "3"
+      MAX_CONCURRENCY: "64"
+      PROBE_OVERALL_TIMEOUT: "30.0"
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - certs:/app/certs:ro
+    networks:
+      - net_dns
+      - net_allowed
+      - net_denied
+    depends_on:
+      certinit:
+        condition: service_completed_successfully
+      dns-service:
+        condition: service_started
+      target-allowed:
+        condition: service_started
+
+volumes:
+  certs:
+  dns-state:
